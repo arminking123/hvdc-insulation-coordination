@@ -1,0 +1,110 @@
+"""Study runner.
+
+Loads the system definition YAML, builds SideParameters for AC and DC,
+runs the five-step IC calculation chain for every equipment location defined
+in the YAML, and returns a StudyResult container with all ICResult objects.
+
+Also handles CSV export of the summary table.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+import yaml
+
+from .ic_engine import run_ic_study_for_location
+from .models import ICResult, SideParameters
+
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"
+
+
+def load_system_definition(path: Path | str | None = None) -> dict:
+    """Load the YAML system definition file."""
+    target = Path(path) if path else DATA_DIR / "system_definition.yaml"
+    with open(target, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def _build_side_params(cfg: dict, side: str) -> SideParameters:
+    """Construct SideParameters from a YAML sub-section (ac_system or dc_system)."""
+    cov_key = "cov_kv" if side == "dc" else "nominal_kv"
+    return SideParameters(
+        cov_kv=float(cfg[cov_key]),
+        tov_factor=float(cfg["tov_factor"]),
+        sfo_factor=float(cfg["sfo_factor"]),
+        ffo_factor=float(cfg["ffo_factor"]),
+        tov_arrester_factor=float(cfg["tov_arrester_factor"]),
+        protection_factor=float(cfg["protection_factor"]),
+        coordination_factor_kc=float(cfg["coordination_factor_kc"]),
+        side=side,
+    )
+
+
+@dataclass
+class StudyResult:
+    """Container for all IC results produced by the study."""
+
+    project: dict
+    site: dict
+    results: list[ICResult] = field(default_factory=list)
+
+    @property
+    def summary_frame(self) -> pd.DataFrame:
+        return pd.DataFrame([r.summary_row() for r in self.results])
+
+    def dc_results(self) -> list[ICResult]:
+        return [r for r in self.results if r.side == "dc"]
+
+    def ac_results(self) -> list[ICResult]:
+        return [r for r in self.results if r.side == "ac"]
+
+
+def run_study(system_def_path: Path | str | None = None) -> StudyResult:
+    """Run the full insulation coordination study.
+
+    Loads the system definition, runs all five calculation steps for every
+    equipment location, and returns a StudyResult.
+    """
+    defn = load_system_definition(system_def_path)
+
+    dc_params = _build_side_params(defn["dc_system"], "dc")
+    ac_params = _build_side_params(defn["ac_system"], "ac")
+
+    altitude_m = float(defn["site"].get("altitude_m", 0))
+
+    dc_table = defn["standard_withstand_levels"]["dc_liwv_table"]
+    ac_table = defn["standard_withstand_levels"]["ac_liwv_table"]
+
+    study = StudyResult(project=defn["project"], site=defn["site"])
+
+    for loc in defn["equipment_locations"]:
+        side = loc["side"]
+        params = dc_params if side == "dc" else ac_params
+        table = dc_table if side == "dc" else ac_table
+
+        result = run_ic_study_for_location(
+            location_id=loc["id"],
+            description=loc["description"],
+            side=side,
+            connected_equipment=loc.get("connected_equipment", []),
+            params=params,
+            standard_table=table,
+            altitude_m=altitude_m,
+        )
+        study.results.append(result)
+
+    return study
+
+
+def export_summary_csv(study: StudyResult, output_dir: Path | str | None = None) -> Path:
+    """Write the IC summary table to CSV and return the file path."""
+    out = Path(output_dir) if output_dir else OUTPUT_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "ic_summary_table.csv"
+    study.summary_frame.to_csv(path, index=False)
+    return path

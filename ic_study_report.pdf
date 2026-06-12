@@ -1,0 +1,22 @@
+[
+  "tests/test_ic_engine.py::TestEndToEnd::test_full_chain_produces_result",
+  "tests/test_ic_engine.py::TestEndToEnd::test_full_study_runs_from_yaml",
+  "tests/test_ic_engine.py::TestEndToEnd::test_summary_row_has_expected_keys",
+  "tests/test_ic_engine.py::TestStep1Overvoltages::test_cov_preserved_in_profile",
+  "tests/test_ic_engine.py::TestStep1Overvoltages::test_sfo_and_ffo_derived_correctly",
+  "tests/test_ic_engine.py::TestStep1Overvoltages::test_tov_equals_cov_times_factor",
+  "tests/test_ic_engine.py::TestStep2ArresterSelection::test_energy_class_assigned",
+  "tests/test_ic_engine.py::TestStep2ArresterSelection::test_uc_equals_cov",
+  "tests/test_ic_engine.py::TestStep2ArresterSelection::test_up_equals_ur_times_protection_factor",
+  "tests/test_ic_engine.py::TestStep2ArresterSelection::test_ur_standard_at_or_above_calculated",
+  "tests/test_ic_engine.py::TestStep3WithstandRequirements::test_required_liwv_above_arrester_up",
+  "tests/test_ic_engine.py::TestStep3WithstandRequirements::test_required_liwv_equals_up_times_kc",
+  "tests/test_ic_engine.py::TestStep3WithstandRequirements::test_required_siwv_below_liwv",
+  "tests/test_ic_engine.py::TestStep4StandardLevels::test_margin_is_non_negative",
+  "tests/test_ic_engine.py::TestStep4StandardLevels::test_selected_liwv_at_or_above_required",
+  "tests/test_ic_engine.py::TestStep5Clearances::test_altitude_correction_applied",
+  "tests/test_ic_engine.py::TestStep5Clearances::test_altitude_factor_at_sea_level_is_one",
+  "tests/test_ic_engine.py::TestStep5Clearances::test_altitude_factor_increases_with_altitude",
+  "tests/test_ic_engine.py::TestStep5Clearances::test_clearance_scales_with_liwv",
+  "tests/test_ic_engine.py::TestStep5Clearances::test_phase_phase_exceeds_phase_earth"
+]

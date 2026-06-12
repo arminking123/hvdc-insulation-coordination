@@ -1,21 +1,348 @@
-MIT License
+"""PDF insulation coordination study report generator (reportlab).
 
-Copyright (c) 2026 Armin Shahbazi
+Produces a professional engineering study report structured as:
+  1. Cover page with document control block
+  2. Purpose and scope
+  3. System description
+  4. Calculation methodology (the five-step chain)
+  5. DC-side results — per-location tables
+  6. AC-side results — per-location tables
+  7. IC summary table (all locations)
+  8. Equipment specification summary
+  9. Minimum clearances summary
+ 10. Conclusions and recommended next actions
+ 11. Disclaimer
+"""
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+from __future__ import annotations
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+from datetime import date
+from pathlib import Path
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+)
+
+from .models import ICResult
+from .study_runner import OUTPUT_DIR, StudyResult
+
+NAVY = colors.HexColor("#1F4E79")
+LIGHT_BLUE = colors.HexColor("#D9E2F3")
+TEAL = colors.HexColor("#0F6E56")
+LIGHT_TEAL = colors.HexColor("#E1F5EE")
+AMBER = colors.HexColor("#ED7D31")
+RED = colors.HexColor("#C00000")
+GREEN = colors.HexColor("#70AD47")
+GREY = colors.HexColor("#666666")
+LIGHT_GREY = colors.HexColor("#F5F5F5")
+
+
+def _styles() -> dict[str, ParagraphStyle]:
+    base = getSampleStyleSheet()
+    return {
+        "title": ParagraphStyle("RTitle", parent=base["Title"],
+                                fontSize=22, textColor=NAVY, spaceAfter=4),
+        "subtitle": ParagraphStyle("RSub", parent=base["Normal"],
+                                   fontSize=12, textColor=GREY, spaceAfter=3),
+        "h1": ParagraphStyle("RH1", parent=base["Heading1"],
+                              fontSize=14, textColor=NAVY, spaceBefore=12, spaceAfter=5),
+        "h2": ParagraphStyle("RH2", parent=base["Heading2"],
+                              fontSize=12, textColor=NAVY, spaceBefore=8, spaceAfter=4),
+        "body": ParagraphStyle("RBody", parent=base["Normal"],
+                               fontSize=9, leading=13, spaceAfter=4),
+        "small": ParagraphStyle("RSmall", parent=base["Normal"],
+                                fontSize=7.5, textColor=GREY),
+        "cell": ParagraphStyle("RCell", parent=base["Normal"],
+                               fontSize=8, leading=10),
+        "mono": ParagraphStyle("RMono", parent=base["Code"],
+                               fontSize=8, leading=12, textColor=NAVY),
+    }
+
+
+def _header_table(data: list[list], col_widths: list[float]) -> Table:
+    t = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GREY]),
+        ("GRID",       (0, 0), (-1, -1), 0.3, colors.HexColor("#9DB2D5")),
+        ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING",   (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
+    ]))
+    return t
+
+
+def _result_tables(result: ICResult, styles: dict, story: list) -> None:
+    """Add the per-location detail tables to the story."""
+    ov = result.overvoltage
+    arr = result.arrester
+    wth = result.withstand
+    std = result.standard
+    clr = result.clearance
+
+    story.append(Paragraph(f"Location: {result.location_id} — {result.description}",
+                           styles["h2"]))
+    if result.connected_equipment:
+        story.append(Paragraph(
+            "Connected equipment: " + " · ".join(result.connected_equipment),
+            styles["small"]))
+        story.append(Spacer(1, 3))
+
+    w = [28*mm, 32*mm, 32*mm, 32*mm, 32*mm]
+
+    # Overvoltage profile
+    ov_data = [
+        ["Parameter", "COV (kV)", "TOV (kV)", "SFO (kV)", "FFO (kV)"],
+        ["Value", f"{ov.cov_kv:.1f}", f"{ov.tov_kv:.1f}",
+         f"{ov.sfo_kv:.1f}", f"{ov.ffo_kv:.1f}"],
+    ]
+    story.append(Paragraph("Step 1 — overvoltage profile", styles["body"]))
+    story.append(_header_table(ov_data, w))
+    story.append(Spacer(1, 4))
+
+    # Arrester selection
+    arr_data = [
+        ["Parameter", "Uc (kV)", "Ur calculated (kV)", "Ur standard (kV)",
+         "Up (kV)"],
+        ["Value", f"{arr.uc_kv:.1f}", f"{arr.ur_kv:.1f}",
+         f"{arr.ur_standard_kv:.0f}", f"{arr.up_kv:.1f}"],
+    ]
+    story.append(Paragraph("Step 2 — arrester selection", styles["body"]))
+    story.append(_header_table(arr_data, w))
+    story.append(Spacer(1, 4))
+
+    # Withstand requirements and standard levels
+    ws_data = [
+        ["Parameter", "Req. LIWV (kV)", "Sel. LIWV (kV)",
+         "Req. SIWV (kV)", "Sel. SIWV (kV)"],
+        ["Value",
+         f"{wth.required_liwv_kv:.1f}",
+         f"{std.selected_liwv_kv:.0f}  (+{std.margin_liwv_pct:.1f}%)",
+         f"{wth.required_siwv_kv:.1f}",
+         f"{std.selected_siwv_kv:.0f}  (+{std.margin_siwv_pct:.1f}%)"],
+    ]
+    story.append(Paragraph("Steps 3 & 4 — required and selected withstand levels",
+                           styles["body"]))
+    story.append(_header_table(ws_data, w))
+    story.append(Spacer(1, 4))
+
+    # Clearances
+    clr_data = [
+        ["Parameter", "Ph-E uncorrected (m)", "Ph-Ph uncorrected (m)",
+         "Ka", "Ph-E corrected (m)"],
+        ["Value",
+         f"{clr.phase_earth_m:.2f}",
+         f"{clr.phase_phase_m:.2f}",
+         f"{clr.altitude_correction:.4f}",
+         f"{clr.corrected_phase_earth_m:.2f}"],
+    ]
+    story.append(Paragraph("Step 5 — minimum air clearances", styles["body"]))
+    story.append(_header_table(clr_data, w))
+    story.append(Spacer(1, 8))
+
+
+def generate_report(study: StudyResult,
+                    output_path: Path | str | None = None) -> Path:
+    """Render the IC study report and return the file path."""
+    out_dir = OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = Path(output_path) if output_path else out_dir / "ic_study_report.pdf"
+
+    styles = _styles()
+    story: list = []
+    proj = study.project
+    site = study.site
+
+    # ----------------------------------------------------------------- cover
+    story.append(Spacer(1, 50*mm))
+    story.append(Paragraph("Insulation Coordination Study", styles["title"]))
+    story.append(Paragraph(proj.get("name", "HVDC Project"), styles["subtitle"]))
+    story.append(Paragraph(proj.get("voltage_class", ""), styles["subtitle"]))
+    story.append(Spacer(1, 6*mm))
+
+    doc_block = [
+        ["Document number", proj.get("report_number", "—")],
+        ["Revision",         proj.get("revision", "—")],
+        ["Author",           proj.get("author", "—")],
+        ["Date",             date.today().isoformat()],
+        ["Site",             site.get("name", "—")],
+        ["Altitude",         f"{site.get('altitude_m', 0)} m ASL"],
+    ]
+    t = Table(doc_block, colWidths=[50*mm, 80*mm], hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("FONTSIZE",   (0, 0), (-1, -1), 9),
+        ("FONTNAME",   (0, 0), (0, -1), "Helvetica-Bold"),
+        ("TEXTCOLOR",  (0, 0), (0, -1), NAVY),
+        ("GRID",       (0, 0), (-1, -1), 0.3, colors.HexColor("#9DB2D5")),
+        ("BACKGROUND", (0, 0), (0, -1), LIGHT_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING",   (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 50*mm))
+    story.append(Paragraph(
+        "<b>Disclaimer:</b> all system parameters, equipment references, and "
+        "calculation results in this report are synthetic demo data created "
+        "for portfolio purposes. They do not represent any real project, "
+        "client, or installation. No proprietary standards text is reproduced.",
+        styles["small"]))
+    story.append(PageBreak())
+
+    # ----------------------------------------------------- purpose and scope
+    story.append(Paragraph("1. Purpose and scope", styles["h1"]))
+    story.append(Paragraph(
+        "This study determines the insulation coordination requirements for "
+        f"the {proj.get('voltage_class', 'HVDC')} converter station. It "
+        "establishes overvoltage levels, surge arrester ratings, equipment "
+        "withstand voltage requirements, and minimum phase-to-earth and "
+        "phase-to-phase air clearances for each equipment location.",
+        styles["body"]))
+    story.append(Paragraph(
+        "The calculation methodology follows the five-step chain aligned with "
+        "generic, standard-based engineering practice for HVDC converter "
+        "stations. All factors are drawn from the project system definition "
+        "file (system_definition.yaml) and can be updated as system studies "
+        "mature.",
+        styles["body"]))
+
+    # ------------------------------------------------- methodology summary
+    story.append(Paragraph("2. Calculation methodology", styles["h1"]))
+    for i, step in enumerate([
+        ("Step 1 — overvoltage classification",
+         "Temporary (TOV), slow-front (SFO), and fast-front (FFO) overvoltage "
+         "levels are derived by applying standard-aligned multipliers to the "
+         "continuous operating voltage (COV)."),
+        ("Step 2 — surge arrester selection",
+         "The arrester continuous operating voltage Uc ≥ COV. The rated voltage "
+         "Ur is selected from standard steps above TOV / tov_arrester_factor. "
+         "The protection level Up = Ur × protection_factor."),
+        ("Step 3 — required withstand voltages",
+         "The equipment LIWV and SIWV requirements are derived from the arrester "
+         "protection level Up multiplied by the coordination factor Kc = 1.15 "
+         "(directly connected arrester, standard-aligned value)."),
+        ("Step 4 — standard level selection",
+         "The nearest standard withstand level at or above the required value is "
+         "selected from the IEC-aligned table in the system definition. The "
+         "margin above the requirement is reported."),
+        ("Step 5 — minimum air clearances",
+         "Phase-to-earth clearance = selected LIWV / 500 kV/m (simplified rod-plane "
+         "gradient). Phase-to-phase = phase-earth × 1.10. Both values are "
+         "multiplied by the altitude correction factor Ka = 1 + 0.00125 × H."),
+    ], start=1):
+        story.append(Paragraph(f"<b>{step[0]}:</b> {step[1]}", styles["body"]))
+
+    story.append(PageBreak())
+
+    # ---------------------------------------------- DC side results
+    story.append(Paragraph("3. DC-side results (±320 kV DC)", styles["h1"]))
+    for result in study.dc_results():
+        _result_tables(result, styles, story)
+    story.append(PageBreak())
+
+    # ---------------------------------------------- AC side results
+    story.append(Paragraph("4. AC-side results (400 kV AC)", styles["h1"]))
+    for result in study.ac_results():
+        _result_tables(result, styles, story)
+    story.append(PageBreak())
+
+    # ------------------------------------------------ summary table
+    story.append(Paragraph("5. IC summary table — all locations", styles["h1"]))
+    frame = study.summary_frame
+    summary_rows = [["Location", "Side", "COV\n(kV)", "Arr. Ur\n(kV)",
+                     "Arr. Up\n(kV)", "Sel. LIWV\n(kV)", "Sel. SIWV\n(kV)",
+                     "Ph-E clr.\n(m)"]]
+    for _, row in frame.iterrows():
+        summary_rows.append([
+            row["location_id"],
+            row["side"],
+            f"{row['cov_kv']:.0f}",
+            f"{row['arrester_ur_kv']:.0f}",
+            f"{row['arrester_up_kv']:.0f}",
+            f"{row['selected_liwv_kv']:.0f}",
+            f"{row['selected_siwv_kv']:.0f}",
+            f"{row['clearance_phase_earth_m']:.2f}",
+        ])
+    col_w = [36*mm, 14*mm, 18*mm, 18*mm, 18*mm, 20*mm, 20*mm, 18*mm]
+    story.append(_header_table(summary_rows, col_w))
+    story.append(Spacer(1, 6*mm))
+    story.append(Paragraph(
+        "All clearance values are corrected for site altitude. "
+        "Selected withstand levels are the nearest standard values above "
+        "the coordination-factor-adjusted protection level of the arrester.",
+        styles["small"]))
+    story.append(PageBreak())
+
+    # ------------------------------------------ conclusions
+    story.append(Paragraph("6. Conclusions and next actions", styles["h1"]))
+    for item in [
+        f"DC pole equipment at ±320 kV requires a minimum LIWV of "
+        f"{min(r.standard.selected_liwv_kv for r in study.dc_results()):.0f} kV "
+        f"and a minimum phase-earth clearance of "
+        f"{min(r.clearance.corrected_phase_earth_m for r in study.dc_results()):.2f} m "
+        f"(altitude corrected).",
+        f"AC-side equipment at 400 kV requires a minimum LIWV of "
+        f"{min(r.standard.selected_liwv_kv for r in study.ac_results()):.0f} kV.",
+        "Surge arrester energy class requirements should be confirmed with "
+        "the arrester manufacturer once the fault-current and energy "
+        "absorption calculations from the system study are available.",
+        "Clearance values are based on a simplified air gap gradient. "
+        "Final values must be verified with site-specific gap factor "
+        "analysis prior to detailed design release.",
+        "The system definition YAML should be updated when PSCAD/EMTP "
+        "overvoltage study results are available to replace the conservative "
+        "standard-aligned factors used in this preliminary study.",
+    ]:
+        story.append(Paragraph(f"\u2022 {item}", styles["body"]))
+
+    story.append(Spacer(1, 6*mm))
+    story.append(Paragraph(
+        "<b>Disclaimer:</b> all data in this report is synthetic demo data "
+        "for portfolio demonstration purposes only.",
+        styles["small"]))
+
+    doc = SimpleDocTemplate(
+        str(path), pagesize=A4,
+        leftMargin=18*mm, rightMargin=18*mm,
+        topMargin=16*mm, bottomMargin=14*mm,
+        title="HVDC Insulation Coordination Study",
+        author=proj.get("author", ""),
+    )
+    doc.build(story, onFirstPage=_footer, onLaterPages=_decoration)
+    return path
+
+
+def _footer(canvas, doc) -> None:
+    canvas.saveState()
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(GREY)
+    canvas.drawString(18*mm, 9*mm,
+                      "HVDC Insulation Coordination Study — synthetic demo data")
+    canvas.drawRightString(A4[0] - 18*mm, 9*mm, f"Page {doc.page}")
+    canvas.restoreState()
+
+
+def _decoration(canvas, doc) -> None:
+    canvas.saveState()
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(GREY)
+    canvas.drawString(18*mm, A4[1] - 9*mm, "Insulation Coordination Study")
+    canvas.drawRightString(A4[0] - 18*mm, A4[1] - 9*mm,
+                           "Doc. No. IC-STUDY-0001")
+    canvas.setStrokeColor(colors.HexColor("#9DB2D5"))
+    canvas.setLineWidth(0.4)
+    canvas.line(18*mm, A4[1] - 11*mm, A4[0] - 18*mm, A4[1] - 11*mm)
+    canvas.drawString(18*mm, 9*mm,
+                      "HVDC Insulation Coordination Study — synthetic demo data")
+    canvas.drawRightString(A4[0] - 18*mm, 9*mm, f"Page {doc.page}")
+    canvas.restoreState()

@@ -1,0 +1,271 @@
+"""Insulation coordination calculation engine.
+
+Implements the five-step calculation chain:
+
+  Step 1 — classify overvoltages (TOV, SFO, FFO) from system parameters
+  Step 2 — select surge arrester (Uc, Ur, Up)
+  Step 3 — derive required withstand voltages (LIWV, SIWV) with Kc margin
+  Step 4 — select nearest standard withstand level (IEC 60071-aligned)
+  Step 5 — calculate minimum air clearances with altitude correction
+
+All calculations use generic, standard-aligned engineering practice.
+No proprietary project data or copyrighted standard text is reproduced.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from .models import (
+    ArresterSelection,
+    ClearanceResult,
+    ICResult,
+    OvervoltageProfile,
+    SideParameters,
+    StandardLevel,
+    WithstandRequirement,
+)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Overvoltage classification
+# ---------------------------------------------------------------------------
+
+def classify_overvoltages(
+    location_id: str,
+    side: str,
+    params: SideParameters,
+) -> OvervoltageProfile:
+    """Apply overvoltage factors to COV to derive TOV, SFO, and FFO levels.
+
+    The factors originate from system studies (PSCAD / EMTP simulations) on
+    the actual project. For a portfolio study, conservative standard-aligned
+    values from the system definition YAML are used.
+    """
+    return OvervoltageProfile(
+        location_id=location_id,
+        side=side,
+        cov_kv=params.cov_kv,
+        tov_kv=round(params.cov_kv * params.tov_factor, 1),
+        sfo_kv=round(params.cov_kv * params.sfo_factor, 1),
+        ffo_kv=round(params.cov_kv * params.ffo_factor, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Surge arrester selection
+# ---------------------------------------------------------------------------
+
+# Standard arrester rated voltage steps (kV).
+# On a real project these come from the manufacturer's catalogue.
+# These generic steps cover the range needed for ±320 kV DC and 400 kV AC.
+_STANDARD_UR_STEPS = [
+    72, 90, 108, 120, 132, 144, 150, 156, 168, 180, 192, 204, 216,
+    228, 240, 252, 264, 288, 312, 336, 360, 384, 408, 432, 456, 480,
+    504, 528, 552, 576, 600, 648, 696, 744, 792, 840, 900, 960, 1020,
+]
+
+
+def _next_standard_ur(calculated_ur: float) -> float:
+    """Return the nearest standard Ur step at or above the calculated value."""
+    for step in _STANDARD_UR_STEPS:
+        if step >= calculated_ur:
+            return float(step)
+    return round(calculated_ur * 1.05, 0)   # extrapolate if above table range
+
+
+def select_arrester(
+    location_id: str,
+    side: str,
+    params: SideParameters,
+    overvoltage: OvervoltageProfile,
+) -> ArresterSelection:
+    """Select the surge arrester for a given equipment location.
+
+    Design logic:
+      Uc  ≥ COV                        (must handle continuous operating voltage)
+      Ur  ≥ TOV / tov_arrester_factor  (must survive temporary overvoltage)
+      Up   = Ur_standard × protection_factor  (residual voltage → equipment must
+                                               withstand this)
+    """
+    uc_kv = params.cov_kv                           # Uc equals COV
+    ur_calc = overvoltage.tov_kv / params.tov_arrester_factor
+    ur_standard = _next_standard_ur(ur_calc)
+    up_kv = round(ur_standard * params.protection_factor, 1)
+
+    return ArresterSelection(
+        location_id=location_id,
+        side=side,
+        uc_kv=uc_kv,
+        ur_kv=round(ur_calc, 1),
+        up_kv=up_kv,
+        ur_standard_kv=ur_standard,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Required withstand voltages
+# ---------------------------------------------------------------------------
+
+def required_withstand(
+    location_id: str,
+    side: str,
+    arrester: ArresterSelection,
+    params: SideParameters,
+) -> WithstandRequirement:
+    """Apply the coordination factor Kc to the arrester protection level.
+
+    The equipment insulation must withstand the arrester protection level
+    multiplied by Kc. Kc = 1.15 is the standard value for equipment directly
+    connected to a surge arrester (IEC 60071-1 aligned).
+
+    LIWV is derived from the FFO (fast-front / lightning impulse) protection level.
+    SIWV is derived from the SFO (slow-front / switching impulse) protection level,
+    scaled by the ratio of SFO to FFO overvoltage.
+    """
+    kc = params.coordination_factor_kc
+
+    # LIWV: arrester protects against FFO → required LIWV = Up × Kc
+    required_liwv = round(arrester.up_kv * kc, 1)
+
+    # SIWV: scale LIWV requirement by the SFO/FFO ratio from the overvoltage study
+    # (switching surges are lower than lightning; SIWV is typically 80–90% of LIWV)
+    sfo_ffo_ratio = params.sfo_factor / params.ffo_factor
+    required_siwv = round(required_liwv * sfo_ffo_ratio, 1)
+
+    return WithstandRequirement(
+        location_id=location_id,
+        side=side,
+        required_liwv_kv=required_liwv,
+        required_siwv_kv=required_siwv,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Standard level selection
+# ---------------------------------------------------------------------------
+
+def select_standard_level(
+    location_id: str,
+    side: str,
+    withstand: WithstandRequirement,
+    standard_table: list[dict[str, Any]],
+) -> StandardLevel:
+    """Select the nearest IEC standard withstand level above the required values.
+
+    The table is loaded from the system definition YAML. Each row contains:
+      up_to_kv, liwv_kv, siwv_kv
+    """
+    selected = None
+    for row in sorted(standard_table, key=lambda r: r["up_to_kv"]):
+        if (row["liwv_kv"] >= withstand.required_liwv_kv
+                and row["siwv_kv"] >= withstand.required_siwv_kv):
+            selected = row
+            break
+
+    if selected is None:
+        # Required level exceeds table — use the highest entry and flag
+        selected = sorted(standard_table, key=lambda r: r["liwv_kv"])[-1]
+
+    margin_liwv = round(
+        (selected["liwv_kv"] - withstand.required_liwv_kv)
+        / withstand.required_liwv_kv * 100, 1
+    )
+    margin_siwv = round(
+        (selected["siwv_kv"] - withstand.required_siwv_kv)
+        / withstand.required_siwv_kv * 100, 1
+    )
+
+    return StandardLevel(
+        location_id=location_id,
+        side=side,
+        selected_liwv_kv=float(selected["liwv_kv"]),
+        selected_siwv_kv=float(selected["siwv_kv"]),
+        margin_liwv_pct=margin_liwv,
+        margin_siwv_pct=margin_siwv,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Minimum air clearances
+# ---------------------------------------------------------------------------
+
+# Simplified rod-plane gap withstand gradient (kV/m) for fast-front impulse.
+# Real projects use detailed gap factor calculations per IEC 60071-2.
+# This approximation is adequate for portfolio-level estimation.
+_LIWV_GRADIENT_KV_PER_M = 500.0   # conservative air insulation gradient
+
+# Phase-to-phase clearance is typically 1.1 × phase-to-earth for HVDC busbars
+_PHASE_PHASE_FACTOR = 1.10
+
+
+def altitude_correction_factor(altitude_m: float) -> float:
+    """Ka = (1 + 0.00125 * H) — altitude correction for air insulation.
+
+    At higher altitudes air density decreases, reducing the withstand voltage
+    of air gaps. The clearance must be multiplied by Ka to compensate.
+    Standard-aligned approximation per IEC 60071-2.
+    """
+    return round(1.0 + 0.00125 * altitude_m, 4)
+
+
+def calculate_clearances(
+    location_id: str,
+    standard: StandardLevel,
+    altitude_m: float,
+) -> ClearanceResult:
+    """Derive minimum air clearances from the selected LIWV.
+
+    Phase-to-earth clearance = LIWV_kV / gradient_kV_per_m
+    Phase-to-phase clearance = phase_earth × phase_phase_factor
+    Both values are then multiplied by the altitude correction factor Ka.
+    """
+    ka = altitude_correction_factor(altitude_m)
+
+    phase_earth = round(standard.selected_liwv_kv / _LIWV_GRADIENT_KV_PER_M, 2)
+    phase_phase = round(phase_earth * _PHASE_PHASE_FACTOR, 2)
+    corrected_pe = round(phase_earth * ka, 2)
+    corrected_pp = round(phase_phase * ka, 2)
+
+    return ClearanceResult(
+        location_id=location_id,
+        phase_earth_m=phase_earth,
+        phase_phase_m=phase_phase,
+        altitude_correction=ka,
+        corrected_phase_earth_m=corrected_pe,
+        corrected_phase_phase_m=corrected_pp,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — run all five steps for one location
+# ---------------------------------------------------------------------------
+
+def run_ic_study_for_location(
+    location_id: str,
+    description: str,
+    side: str,
+    connected_equipment: list[str],
+    params: SideParameters,
+    standard_table: list[dict[str, Any]],
+    altitude_m: float,
+) -> ICResult:
+    """Run the complete five-step IC calculation chain for one equipment location."""
+    overvoltage = classify_overvoltages(location_id, side, params)
+    arrester = select_arrester(location_id, side, params, overvoltage)
+    withstand = required_withstand(location_id, side, arrester, params)
+    standard = select_standard_level(location_id, side, withstand, standard_table)
+    clearance = calculate_clearances(location_id, standard, altitude_m)
+
+    return ICResult(
+        location_id=location_id,
+        description=description,
+        side=side,
+        connected_equipment=connected_equipment,
+        overvoltage=overvoltage,
+        arrester=arrester,
+        withstand=withstand,
+        standard=standard,
+        clearance=clearance,
+    )
